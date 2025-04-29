@@ -16,7 +16,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
-from aiohttp import web
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -24,14 +23,17 @@ load_dotenv()
 # Конфигурация
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DASH_ADDRESSES = os.getenv("DASH_ADDRESSES", "").split(",")
-DATABASE_URL = os.getenv("DATABASE_URL")
+DB_NAME = os.getenv("DB_NAME", "telegram_bot_db")
+DB_USER = os.getenv("DB_USER", "bot_user")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_HOST = os.getenv("DB_HOST", "localhost")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 CASHBACK_PERCENT = 5
 REFERRAL_BONUS = 10
 MIN_DEPOSIT = 0.0001
 RESERVATION_TIMEOUT = 1800
 MAX_DB_RETRIES = 5
-MEDIA_FOLDER = "/tmp/products_media"
+MEDIA_FOLDER = "/var/lib/telegram_bot/media"
 
 # Настройка логирования
 logging.basicConfig(
@@ -64,7 +66,6 @@ class PaymentState(StatesGroup):
     activate_promocode = State()
 
 
-# Декоратор для повторных попыток БД
 def db_retry(func):
     @wraps(func)
     async def wrapper(*args, **kwargs):
@@ -85,20 +86,24 @@ def db_retry(func):
     return wrapper
 
 
-# Пулы подключений к БД
 pool = None
 
 
 async def create_db_pool():
-    global pool
-    pool = await asyncpg.create_pool(DATABASE_URL)
-    return pool
+    return await asyncpg.create_pool(
+        database=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        host=DB_HOST
+    )
 
 
 @db_retry
 async def init_db():
     global pool
     pool = await create_db_pool()
+    Path(MEDIA_FOLDER).mkdir(parents=True, exist_ok=True)
+
     async with pool.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users(
@@ -123,7 +128,7 @@ async def init_db():
                 type TEXT NOT NULL,
                 date TIMESTAMP NOT NULL,
                 status TEXT NOT NULL CHECK(status IN ('pending', 'completed', 'failed'))
-            """)
+            )""")
 
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS addresses(
@@ -131,14 +136,14 @@ async def init_db():
                 address TEXT NOT NULL UNIQUE,
                 status TEXT CHECK(status IN ('free', 'busy')) DEFAULT 'free',
                 user_id BIGINT,
-                reserved_time TIMESTAMP)
-            """)
+                reserved_time TIMESTAMP
+            )""")
 
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS districts(
                 id SERIAL PRIMARY KEY,
-                name TEXT NOT NULL UNIQUE)
-            """)
+                name TEXT NOT NULL UNIQUE
+            )""")
 
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS products(
@@ -146,8 +151,8 @@ async def init_db():
                 district_id INTEGER NOT NULL REFERENCES districts(id),
                 name TEXT NOT NULL,
                 price NUMERIC NOT NULL,
-                description TEXT)
-            """)
+                description TEXT
+            )""")
 
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS promocodes(
@@ -155,10 +160,9 @@ async def init_db():
                 amount NUMERIC NOT NULL,
                 max_uses INTEGER NOT NULL,
                 remaining_uses INTEGER NOT NULL,
-                created_at TIMESTAMP NOT NULL)
-            """)
+                created_at TIMESTAMP NOT NULL
+            )""")
 
-        # Добавляем начальные данные
         districts = ['Arabkir', 'Kentron', 'Zeytun']
         for district in districts:
             await conn.execute("""
@@ -175,23 +179,6 @@ async def init_db():
             """, addr.strip())
 
 
-# HTTP сервер для Railway
-async def health_check(request):
-    return web.Response(text="Bot is running")
-
-
-async def run_server():
-    app = web.Application()
-    app.router.add_get("/", health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.getenv("PORT", 8000))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logger.info(f"HTTP server started on port {port}")
-
-
-# Клавиатуры
 def create_main_menu():
     builder = InlineKeyboardBuilder()
     builder.row(
@@ -231,7 +218,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
                     pass
 
         async with pool.acquire() as conn:
-            # Регистрация пользователя
             await conn.execute("""
                 INSERT INTO users 
                 (id, name, username, registration_date, last_activity, referral_code)
@@ -326,7 +312,7 @@ async def handle_deposit(callback: types.CallbackQuery, state: FSMContext):
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="📋 Copy Address", callback_data="copy_address"),
                  InlineKeyboardButton(text="❌ Cancel", callback_data="cancel_deposit")]
-            )
+            ])
         )
         await state.update_data(
             message_id=msg.message_id,
@@ -503,14 +489,14 @@ async def handle_profile(callback: types.CallbackQuery):
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text="🎫 Activate Promo", callback_data="activate_promo"),
                      InlineKeyboardButton(text="⬅️ Back", callback_data="main")]
-                )
+                ])
             )
     except Exception as e:
         logger.error(f"Profile error: {e}")
         await callback.answer("Error loading profile", show_alert=True)
 
 
-async def graceful_shutdown(loop, sig=None):
+async def graceful_shutdown(sig=None):
     logger.info(f"Shutting down...")
     tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
 
@@ -520,12 +506,10 @@ async def graceful_shutdown(loop, sig=None):
     await asyncio.gather(*tasks, return_exceptions=True)
     if pool:
         await pool.close()
-    loop.stop()
 
 
 async def main():
     await init_db()
-    Path(MEDIA_FOLDER).mkdir(parents=True, exist_ok=True)
 
     loop = asyncio.get_running_loop()
 
@@ -533,15 +517,8 @@ async def main():
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(
                 sig,
-                lambda s=sig: asyncio.create_task(graceful_shutdown(loop, s))
+                lambda s=sig: asyncio.create_task(graceful_shutdown(s))
             )
-    else:
-        def signal_handler():
-            asyncio.create_task(graceful_shutdown(loop))
-
-        signal.signal(signal.SIGINT, signal_handler)
-
-    asyncio.create_task(run_server())
 
     try:
         await dp.start_polling(bot)
